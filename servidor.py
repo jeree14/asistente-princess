@@ -169,4 +169,4 @@ def chat():
 if __name__ == '__main__':
     # En local: python servidor.py  ->  http://127.0.0.1:5000
     # En Render se arranca con gunicorn (este bloque no se usa)
-    app.run(port=int(os.environ.get("PORT", 5000)), debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
