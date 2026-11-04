@@ -3,16 +3,14 @@ import re
 import secrets
 import sqlite3
 import hashlib
-import logging
 import smtplib
 import threading
-import traceback
 import time
+import logging
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from email.message import EmailMessage
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+from html import escape
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -24,11 +22,20 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
-app.logger.setLevel(logging.INFO)  # para que los INFO salgan en los logs de Render
+app.logger.setLevel(logging.INFO)  # para que los INFO (CHAT OK ...) salgan en los logs de Render
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
 
-# CORS total para evitar cualquier tipo de bloqueo con GitHub Pages
-CORS(app)
+# Webs que pueden llamar al servidor. Se pueden cambiar en Render con la variable CORS_ORIGINS
+# (direcciones separadas por comas, sin barra final).
+ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv(
+    "CORS_ORIGINS",
+    "http://localhost:8000,http://127.0.0.1:8000,http://localhost:5500,http://127.0.0.1:5500,"
+    "https://shouyi77.github.io"
+).split(",") if origin.strip()]
+CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS},
+                     r"/chat": {"origins": ALLOWED_ORIGINS},
+                     r"/enviar-email-promocional": {"origins": ALLOWED_ORIGINS}},
+     allow_headers=["Content-Type", "Authorization"])
 
 try:
     from google import genai
@@ -40,7 +47,7 @@ except ImportError:
 api_key = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key) if genai and api_key else None
 HOTEL_NAME = "La Palma Princess"
-HOTEL_EMAIL = os.getenv("HOTEL_EMAIL", "hotelprincesslapalmatrabajo@gmail.com")
+HOTEL_EMAIL = os.getenv("HOTEL_EMAIL", "hotelPrincessLaPalma@gmail.com")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "reservas.sqlite3"))
 HOTEL_TIMEZONE = ZoneInfo("Atlantic/Canary")
@@ -56,10 +63,8 @@ SERVICE_TIMES = {"spa": ("09:00", "11:00", "13:00", "15:00", "17:00"),
                  "restaurant": ("13:00", "14:00", "19:00", "20:00", "21:00"),
                  "activity": ("09:00", "11:00", "15:00", "17:00")}
 
-# MODELOS DE RESPALDO PARA EL CHATBOT
-# Se pueden cambiar SIN tocar el codigo: en Render -> Environment -> MODELOS_IA
-# (nombres separados por comas, el primero es el preferido).
-# Comprueba los nombres vigentes en https://ai.google.dev/gemini-api/docs/models
+# Modelos de la IA del chatbot. Se pueden cambiar SIN tocar el codigo: en Render -> Environment
+# -> MODELOS_IA (nombres separados por comas, el primero es el preferido).
 MODELOS_IA = [
     m.strip() for m in os.getenv(
         "MODELOS_IA",
@@ -142,6 +147,7 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
         """)
+        # Bases de datos creadas antes de las cuentas: añade la columna user_id si falta.
         for table in ("bookings", "service_bookings"):
             columns = [row["name"] for row in db.execute(f"PRAGMA table_info({table})")]
             if "user_id" not in columns:
@@ -191,34 +197,37 @@ def email_valid(value):
     return len(value) <= 254 and re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value) is not None
 
 
-def send_email(recipient, subject, body, html_body=None):
+def send_email(recipient, subject, body):
+    """Envía un correo (texto o HTML si el cuerpo empieza por '<').
+    La contraseña NUNCA va en el código: se lee de la variable SMTP_PASSWORD en Render
+    (para Gmail, una 'contraseña de aplicación')."""
     host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+    port = int(os.getenv("SMTP_PORT", "465"))
     username = os.getenv("SMTP_USERNAME", "hotelprincesslapalmatrabajo@gmail.com")
     password = os.getenv("SMTP_PASSWORD")
-    
     if not password:
-        app.logger.warning("SMTP_PASSWORD no configurado.")
+        app.logger.warning("SMTP_PASSWORD no configurado: no se envía el correo a %s", recipient)
         return False
-
-    message = MIMEMultipart("alternative") if html_body else EmailMessage()
+    message = EmailMessage()
     message["Subject"] = subject
-    message["From"] = os.getenv("SMTP_FROM") or HOTEL_EMAIL
+    message["From"] = os.getenv("SMTP_FROM") or username
     message["To"] = recipient
-
-    if html_body:
-        message.attach(MIMEText(body, "plain"))
-        message.attach(MIMEText(html_body, "html"))
+    if body.lstrip().startswith("<"):
+        message.set_content("Este mensaje está en formato HTML.")
+        message.add_alternative(body, subtype="html")
     else:
         message.set_content(body)
-
     try:
-        port = int(os.getenv("SMTP_PORT", "465"))
-        with smtplib.SMTP_SSL(host, port, timeout=15) as smtp:
+        usar_ssl = port == 465 or os.getenv("SMTP_SSL") == "1"
+        conexion = smtplib.SMTP_SSL(host, port, timeout=15) if usar_ssl else smtplib.SMTP(host, port, timeout=15)
+        with conexion as smtp:
+            if not usar_ssl and os.getenv("SMTP_STARTTLS", "1") == "1":
+                smtp.starttls()
             smtp.login(username, password)
             smtp.send_message(message)
         return True
-    except Exception:
-        app.logger.exception("Error al enviar email a %s", recipient)
+    except (OSError, smtplib.SMTPException, ValueError):
+        app.logger.exception("No se pudo enviar el correo a %s", recipient)
         return False
 
 
@@ -251,6 +260,35 @@ def room_availability(db, room, checkin, checkout):
     return max(0, ROOMS[room]["inventory"] - reserved)
 
 
+def send_booking_email(email, name, reference, token, checkin, checkout, total):
+    management_link = PUBLIC_BASE_URL + "/reservas.html?manage=" + token
+    body_html = f"""
+    <div style="font-family: Arial, sans-serif; padding: 20px; background-color: #f4f6f8;">
+        <div style="max-width: 600px; margin: 0 auto; background: white; border-radius: 8px; padding: 30px; border-top: 5px solid #12303a;">
+            <h1 style="color: #12303a; margin-top: 0;">Confirmación de Reserva</h1>
+            <p>Hola <strong>{escape(name)}</strong>,</p>
+            <p>Hemos recibido tu solicitud de reserva en el <strong>Hotel Princess La Palma</strong>. A continuación tienes los detalles:</p>
+
+            <table style="width: 100%; border-collapse: collapse; margin: 20px 0; background: #f8fafb; border: 1px solid #e2e8f0;">
+                <tr><td style="padding: 10px; border-bottom: 1px solid #e2e8f0;"><strong>Referencia:</strong></td><td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">{reference}</td></tr>
+                <tr><td style="padding: 10px; border-bottom: 1px solid #e2e8f0;"><strong>Entrada:</strong></td><td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">{checkin}</td></tr>
+                <tr><td style="padding: 10px; border-bottom: 1px solid #e2e8f0;"><strong>Salida:</strong></td><td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">{checkout}</td></tr>
+                <tr><td style="padding: 10px;"><strong>Total orientativo:</strong></td><td style="padding: 10px;"><strong>{total:.2f} EUR</strong></td></tr>
+            </table>
+
+            <p><a href="{management_link}" style="background-color: #12303a; color: white; padding: 10px 18px; text-decoration: none; border-radius: 4px; display: inline-block;">Gestionar o Cancelar Reserva</a></p>
+
+            <hr style="border: none; border-top: 1px solid #eeeeee; margin: 20px 0;">
+            <p style="font-size: 12px; color: #777;">Si deseas dejar de recibir avisos, haz clic en <a href="{PUBLIC_BASE_URL}/desuscrito.html?email={escape(email)}">darse de baja</a>.</p>
+        </div>
+    </div>
+    """
+    return send_email(email, f"Reserva {reference} - {HOTEL_NAME}", body_html)
+
+
+# ───────────────────────── Cuentas de usuario y sesiones ─────────────────────────
+# El navegador guarda un token aleatorio (en localStorage) y lo envía en la cabecera
+# "Authorization: Bearer <token>". En la base de datos solo se guarda su hash SHA-256.
 SESSION_DAYS = 30
 MAX_LOGIN_FAILS = 8
 LOGIN_WINDOW = 10 * 60
@@ -323,6 +361,7 @@ def user_json(user):
 
 @app.post("/api/auth/register")
 def register():
+    """Crea la cuenta y deja la sesión iniciada en el mismo paso."""
     data = json_payload()
     if not data:
         return api_error("Envía los datos de registro en formato JSON.", 400)
@@ -348,6 +387,22 @@ def register():
     except sqlite3.IntegrityError:
         return api_error("Ya existe una cuenta con ese email. Inicia sesión.", 409)
     attempts_add(ip_key)
+
+    # Email de bienvenida (si falla el envío, la cuenta se crea igualmente)
+    html_bienvenida = f"""
+    <div style="font-family: Arial, sans-serif; padding: 20px; background-color: #f4f6f8;">
+        <div style="max-width: 600px; margin: 0 auto; background: white; border-radius: 8px; padding: 30px; border-top: 5px solid #12303a;">
+            <h1 style="color: #12303a; margin-top: 0;">¡Bienvenido/a a La Palma Princess!</h1>
+            <p>Hola <strong>{escape(name)}</strong>,</p>
+            <p>Gracias por registrarte. Tu cuenta ha sido creada correctamente.</p>
+            <p>Ahora podrás realizar tus reservas de forma más rápida y acceder a ofertas exclusivas.</p>
+            <hr style="border: none; border-top: 1px solid #eeeeee; margin: 20px 0;">
+            <p style="font-size: 12px; color: #777;">Si deseas darte de baja, haz clic en <a href="{PUBLIC_BASE_URL}/desuscrito.html?email={escape(email)}">darse de baja</a>.</p>
+        </div>
+    </div>
+    """
+    send_email(email, "¡Bienvenido/a a La Palma Princess!", html_bienvenida)
+
     return jsonify({"token": token, "user": {"name": name, "email": email}}), 201
 
 
@@ -365,6 +420,7 @@ def login():
         return api_error("Demasiados intentos fallidos. Espera unos minutos e inténtalo de nuevo.", 429)
     with connect_db() as db:
         user = db.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+        # Se comprueba siempre un hash para que el tiempo de respuesta no delate si el email existe.
         valid = check_password_hash(user["password_hash"] if user else DUMMY_HASH, password)
         if not user or not valid:
             attempts_add(key)
@@ -411,9 +467,304 @@ def my_bookings():
     return jsonify({"bookings": [dict(row) for row in rooms], "services": [dict(row) for row in services]})
 
 
+@app.post("/api/me/bookings/<reference>/cancel")
+def cancel_my_booking(reference):
+    with connect_db() as db:
+        user = current_user(db)
+        if not user:
+            return api_error("Inicia sesión para gestionar tus reservas.", 401)
+        cursor = db.execute(
+            "UPDATE bookings SET status = 'cancelled' WHERE reference = ? AND user_id = ? AND status = 'confirmed'",
+            (reference.upper(), user["id"]),
+        )
+        if cursor.rowcount == 0:
+            return api_error("No se encontró una reserva activa tuya con esa referencia.", 404)
+    email_sent = send_email(
+        user["email"], f"Cancelación {reference.upper()} - {HOTEL_NAME}",
+        f"Hola {user['name']}:\n\nTu reserva {reference.upper()} ha sido cancelada."
+    )
+    return jsonify({"message": "Reserva cancelada.", "email_sent": email_sent})
+
+
 @app.get("/api/health")
 def health():
     return jsonify({"ok": True})
+
+
+@app.get("/api/availability")
+def availability():
+    checkin = valid_date(request.args.get("checkin"))
+    checkout = valid_date(request.args.get("checkout"))
+    room = request.args.get("room", "Estándar")
+    rooms = parse_integer(request.args.get("rooms", "1"))
+    adults = parse_integer(request.args.get("adults", "2"))
+    children = parse_integer(request.args.get("children", "0"))
+    if None in (rooms, adults, children):
+        return api_error("Los huéspedes y las habitaciones deben ser números válidos.", 400)
+    resident = request.args.get("resident") == "1"
+    promo = request.args.get("promo", "")
+    if not checkin or not checkout or checkin < hotel_today() or checkout <= checkin:
+        return api_error("Indica fechas válidas y una salida posterior a la entrada.", 400)
+    if room not in ROOMS or not 1 <= rooms <= 4 or adults < 1 or adults > 16 or not 0 <= children <= 12:
+        return api_error("Revisa el tipo de habitación y el número de huéspedes.", 400)
+    if not valid_occupancy(room, rooms, adults, children):
+        return api_error("El número de huéspedes supera la capacidad del tipo de habitación.", 400)
+    if promo and not re.fullmatch(r"\d{6}", promo):
+        return api_error("El código promocional debe tener seis dígitos.", 400)
+    nights = (checkout - checkin).days
+    with connect_db() as db:
+        available = room_availability(db, room, checkin.isoformat(), checkout.isoformat())
+    return jsonify({
+        "available": available >= rooms,
+        "rooms_available": available,
+        "nights": nights,
+        "total": booking_total(room, rooms, adults, children, nights, resident, promo),
+        "currency": "EUR",
+        "demo": True,
+    })
+
+
+@app.post("/api/bookings")
+def create_booking():
+    data = json_payload()
+    if not data:
+        return api_error("Envía los datos de la reserva en formato JSON.", 400)
+    name = clean_text(data.get("name"), 100)
+    email = clean_text(data.get("email"), 254)
+    checkin = valid_date(data.get("checkin"))
+    checkout = valid_date(data.get("checkout"))
+    room = clean_text(data.get("room"), 40)
+    message = clean_text(data.get("message"), 1000)
+    promo = clean_text(data.get("promo"), 6)
+    rooms = parse_integer(data.get("rooms", 1))
+    adults = parse_integer(data.get("adults", 2))
+    children = parse_integer(data.get("children", 0))
+    if None in (rooms, adults, children):
+        return api_error("El número de huéspedes y habitaciones no es válido.", 400)
+    resident_value = data.get("resident", False)
+    if not isinstance(resident_value, bool):
+        return api_error("El indicador de residente no es válido.", 400)
+    resident = resident_value
+    if not name or not email_valid(email) or not checkin or not checkout or checkin < hotel_today() or checkout <= checkin:
+        return api_error("Revisa el nombre, el email y las fechas de la reserva.", 400)
+    if room not in ROOMS or not 1 <= rooms <= 4 or not 1 <= adults <= 16 or not 0 <= children <= 12:
+        return api_error("Revisa el tipo de habitación y el número de huéspedes.", 400)
+    if not valid_occupancy(room, rooms, adults, children):
+        return api_error("El número de huéspedes supera la capacidad del tipo de habitación.", 400)
+    if promo and not re.fullmatch(r"\d{6}", promo):
+        return api_error("El código promocional debe tener seis dígitos.", 400)
+
+    reference = secrets.token_hex(4).upper()
+    token = secrets.token_urlsafe(32)
+    total = booking_total(room, rooms, adults, children, (checkout - checkin).days, resident, promo)
+    try:
+        with connect_db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            available = room_availability(db, room, checkin.isoformat(), checkout.isoformat())
+            if available < rooms:
+                return jsonify({"error": "No hay disponibilidad para esas fechas.", "rooms_available": available}), 409
+            user = current_user(db)
+            db.execute(
+                """INSERT INTO bookings
+                   (reference, token_hash, name, email, checkin, checkout, room, rooms, adults,
+                    children, promo, resident, message, total, user_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (reference, hashlib.sha256(token.encode()).hexdigest(), name, email,
+                 checkin.isoformat(), checkout.isoformat(), room, rooms, adults,
+                 children, promo, int(resident), message, total, user["id"] if user else None),
+            )
+    except sqlite3.IntegrityError:
+        return api_error("No se pudo registrar la solicitud. Inténtalo de nuevo.", 409)
+
+    email_sent = send_booking_email(email, name, reference, token, checkin.isoformat(), checkout.isoformat(), total)
+    return jsonify({
+        "reference": reference,
+        "management_token": token,
+        "total": total,
+        "email_sent": email_sent,
+        "message": "Solicitud registrada y confirmación enviada." if email_sent else
+                   "Solicitud registrada. La confirmación por correo está pendiente de configurar.",
+    }), 201
+
+
+def find_booking(token):
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    with connect_db() as db:
+        return db.execute("SELECT * FROM bookings WHERE token_hash = ?", (token_hash,)).fetchone()
+
+
+@app.get("/api/bookings/<token>")
+def get_booking(token):
+    booking = find_booking(token)
+    if not booking:
+        return api_error("No se encontró una reserva con ese enlace.", 404)
+    return jsonify({key: booking[key] for key in (
+        "reference", "name", "email", "checkin", "checkout", "room", "rooms",
+        "adults", "children", "total", "status"
+    )})
+
+
+@app.post("/api/bookings/<token>/cancel")
+def cancel_booking(token):
+    with connect_db() as db:
+        cursor = db.execute(
+            "UPDATE bookings SET status = 'cancelled' WHERE token_hash = ? AND status = 'confirmed'",
+            (hashlib.sha256(token.encode()).hexdigest(),),
+        )
+        if cursor.rowcount == 0:
+            return api_error("No se encontró una reserva activa para cancelar.", 404)
+        booking = db.execute("SELECT * FROM bookings WHERE token_hash = ?",
+                             (hashlib.sha256(token.encode()).hexdigest(),)).fetchone()
+    email_sent = send_email(
+        booking["email"], f"Cancelación {booking['reference']} - {HOTEL_NAME}",
+        f"Hola {booking['name']}:\n\nTu reserva {booking['reference']} ha sido cancelada."
+    )
+    return jsonify({"message": "Reserva cancelada.", "email_sent": email_sent})
+
+
+@app.patch("/api/bookings/<token>")
+def update_booking(token):
+    data = json_payload()
+    if not data:
+        return api_error("Envía los nuevos datos en formato JSON.", 400)
+    booking = find_booking(token)
+    if not booking or booking["status"] != "confirmed":
+        return api_error("No se encontró una reserva activa para modificar.", 404)
+    checkin = valid_date(data.get("checkin", booking["checkin"]))
+    checkout = valid_date(data.get("checkout", booking["checkout"]))
+    room = clean_text(data.get("room", booking["room"]), 40)
+    rooms = parse_integer(data.get("rooms", booking["rooms"]))
+    if rooms is None:
+        return api_error("El número de habitaciones no es válido.", 400)
+    if not checkin or not checkout or checkin < hotel_today() or checkout <= checkin or room not in ROOMS or not 1 <= rooms <= 4:
+        return api_error("Revisa las fechas, el tipo de habitación y el número de habitaciones.", 400)
+    adults = booking["adults"]
+    children = booking["children"]
+    if not valid_occupancy(room, rooms, adults, children):
+        return api_error("El tipo de habitación elegido no admite a todos los huéspedes.", 400)
+    resident = booking["resident"]
+    promo = booking["promo"]
+    total = booking_total(room, rooms, adults, children, (checkout - checkin).days, resident, promo)
+    with connect_db() as db:
+        db.execute("BEGIN IMMEDIATE")
+        available = room_availability(db, room, checkin.isoformat(), checkout.isoformat())
+        if room == booking["room"] and checkin < date.fromisoformat(booking["checkout"]) and checkout > date.fromisoformat(booking["checkin"]):
+            available += booking["rooms"]
+        if available < rooms:
+            return jsonify({"error": "No hay disponibilidad para esos cambios.", "rooms_available": available}), 409
+        db.execute(
+            "UPDATE bookings SET checkin = ?, checkout = ?, room = ?, rooms = ?, total = ? WHERE id = ?",
+            (checkin.isoformat(), checkout.isoformat(), room, rooms, total, booking["id"]),
+        )
+    email_sent = send_email(
+        booking["email"], f"Actualización de reserva {booking['reference']} - {HOTEL_NAME}",
+        f"Hola {booking['name']}:\n\nTu reserva se ha actualizado.\n"
+        f"Entrada: {checkin.isoformat()}\nSalida: {checkout.isoformat()}\n"
+        f"Habitación: {room}\nTotal orientativo: {total:.2f} EUR."
+    )
+    return jsonify({
+        "message": "Reserva actualizada.",
+        "total": total,
+        "email_sent": email_sent,
+    })
+
+
+@app.get("/api/service-slots")
+def service_slots():
+    service = request.args.get("service", "")
+    service_date = valid_date(request.args.get("date"))
+    if service not in SERVICES or not service_date or service_date < hotel_today():
+        return api_error("Indica un servicio y una fecha futura válidos.", 400)
+    with connect_db() as db:
+        slots = []
+        for service_time in SERVICE_TIMES[service]:
+            if service_date == hotel_today() and service_time <= datetime.now(HOTEL_TIMEZONE).strftime("%H:%M"):
+                continue
+            occupied = db.execute(
+                "SELECT COALESCE(SUM(guests), 0) FROM service_bookings WHERE service = ? AND service_date = ? AND service_time = ?",
+                (service, service_date.isoformat(), service_time),
+            ).fetchone()[0]
+            remaining = max(0, SERVICE_CAPACITY[service] - occupied)
+            if remaining:
+                slots.append({"time": service_time, "available": remaining})
+    return jsonify({"service": service, "date": service_date.isoformat(), "slots": slots})
+
+
+@app.post("/api/service-bookings")
+def create_service_booking():
+    data = json_payload()
+    if not data:
+        return api_error("Envía los datos de la cita en formato JSON.", 400)
+    name = clean_text(data.get("name"), 100)
+    email = clean_text(data.get("email"), 254)
+    service = clean_text(data.get("service"), 20)
+    service_date = valid_date(data.get("date"))
+    service_time = clean_text(data.get("time"), 5)
+    notes = clean_text(data.get("notes"), 500)
+    guests = parse_integer(data.get("guests", 1))
+    if guests is None:
+        return api_error("El número de asistentes no es válido.", 400)
+    if not name or not email_valid(email) or service not in SERVICES or not service_date or service_date < hotel_today():
+        return api_error("Revisa el nombre, el email, el servicio y la fecha.", 400)
+    if service_time not in SERVICE_TIMES[service] or not 1 <= guests <= 12:
+        return api_error("Elige una hora disponible y un número válido de asistentes.", 400)
+    if service_date == hotel_today() and service_time <= datetime.now(HOTEL_TIMEZONE).strftime("%H:%M"):
+        return api_error("La hora elegida ya ha pasado.", 400)
+    reference = secrets.token_hex(4).upper()
+    try:
+        with connect_db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            occupied = db.execute(
+                "SELECT COALESCE(SUM(guests), 0) FROM service_bookings WHERE service = ? AND service_date = ? AND service_time = ?",
+                (service, service_date.isoformat(), service_time),
+            ).fetchone()[0]
+            if occupied + guests > SERVICE_CAPACITY[service]:
+                return api_error("Ya no quedan plazas suficientes en esa hora.", 409)
+            user = current_user(db)
+            db.execute(
+                """INSERT INTO service_bookings
+                   (reference, name, email, service, service_date, service_time, guests, notes, user_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (reference, name, email, service, service_date.isoformat(), service_time, guests, notes,
+                 user["id"] if user else None),
+            )
+    except sqlite3.IntegrityError:
+        return api_error("Ya existe una reserva de ese servicio para ese email y horario.", 409)
+    email_sent = send_email(
+        email, f"Reserva de servicio {reference} - {HOTEL_NAME}",
+        f"Hola {name}:\n\nHemos registrado tu reserva de {service} para {service_date.isoformat()} "
+        f"a las {service_time} ({guests} asistentes).\nReferencia: {reference}"
+    )
+    return jsonify({
+        "reference": reference,
+        "email_sent": email_sent,
+        "message": "Cita registrada y confirmación enviada." if email_sent else
+                   "Cita registrada. La confirmación por correo está pendiente de configurar.",
+    }), 201
+
+
+@app.post("/api/newsletter")
+def subscribe_newsletter():
+    data = json_payload()
+    email = clean_text(data.get("email"), 254) if data else ""
+    if not email_valid(email):
+        return api_error("Escribe un email válido.", 400)
+    if data.get("consent") is not True:
+        return api_error("Necesitas aceptar las comunicaciones comerciales para suscribirte.", 400)
+    try:
+        with connect_db() as db:
+            db.execute("INSERT INTO subscribers (email) VALUES (?)", (email.lower(),))
+    except sqlite3.IntegrityError:
+        return jsonify({"message": "Ese email ya está suscrito."})
+    email_sent = send_email(
+        email, f"Suscripción confirmada - {HOTEL_NAME}",
+        f"Gracias por suscribirte a las novedades de {HOTEL_NAME}."
+    )
+    return jsonify({
+        "message": "Suscripción confirmada." if email_sent else
+                   "Suscripción guardada correctamente.",
+        "email_sent": email_sent,
+    }), 201
 
 
 def _datos_dinamicos():
@@ -449,7 +800,7 @@ INFORMACIÓN OFICIAL:
 - Dirección: Carretera de la Costa, Cerca Vieja, 10, 38749 Fuencaliente de La Palma.
 - Teléfono: +34 922 42 55 11 (lunes a viernes, de 09:00 a 17:00).
 - WhatsApp: 613 48 90 55.
-- Email: hotelprincesslapalmatrabajo@gmail.com.
+- Email: {EMAIL}.
 
 ZONAS:
 - Zona general (familiar): siete piscinas exteriores, con piscina infantil, playa de arena artificial y solárium.
@@ -484,7 +835,7 @@ RESERVAS:
 
 SERVICIOS RESERVABLES EN LA WEB (horas disponibles):
 {HORARIOS}
-""".replace("{PRECIOS}", _PRECIOS).replace("{HORARIOS}", _HORARIOS)
+""".replace("{PRECIOS}", _PRECIOS).replace("{HORARIOS}", _HORARIOS).replace("{EMAIL}", HOTEL_EMAIL)
 
 
 def _error_temporal(exc):
@@ -565,10 +916,12 @@ def chat_debug():
     })
 
 
+
+# ───────────────────────── Correos sueltos (una sola definición de cada ruta) ─────────────────────────
 @app.route('/enviar-email-promocional', methods=['POST'])
 def enviar_email_promocional():
     datos = request.get_json(silent=True) or {}
-    email_destino = datos.get("email")
+    email_destino = clean_text(datos.get("email"), 254)
 
     if not email_destino or not email_valid(email_destino):
         return jsonify({"error": "Hace falta especificar un email válido"}), 400
@@ -576,29 +929,23 @@ def enviar_email_promocional():
     try:
         ruta_plantilla = Path('email_marketing.html')
         contenido_html = ruta_plantilla.read_text(encoding='utf-8') if ruta_plantilla.exists() else "<h1>Oferta 10% Dto</h1>"
-        contenido_html = contenido_html.replace('{{email}}', email_destino)
-
-        exito = send_email(
-            recipient=email_destino,
-            subject="¡Oferta especial 10% Dto! - Hotel Princess La Palma",
-            body="¡Oferta especial 10% Dto en Hotel Princess La Palma!",
-            html_body=contenido_html
-        )
-        if exito:
+        contenido_html = contenido_html.replace('{{email}}', escape(email_destino))
+        if send_email(email_destino, "¡Oferta especial 10% Dto! - Hotel Princess La Palma", contenido_html):
             return jsonify({"mensaje": f"Correo promocional enviado a {email_destino} correctamente."}), 200
         return jsonify({"error": "No se pudo enviar el correo promocional."}), 500
-    except Exception as e:
-        return jsonify({"error": f"Error procesando plantilla: {str(e)}"}), 500
+    except Exception:
+        app.logger.exception("Error en /enviar-email-promocional")
+        return jsonify({"error": "Error procesando la plantilla del correo."}), 500
 
 
 @app.route('/api/email-bienvenida', methods=['POST'])
 def email_bienvenida():
     datos = request.get_json(silent=True) or {}
-    nombre = clean_text(datos.get('nombre', 'Usuario'), 100)
+    nombre = escape(clean_text(datos.get('nombre', 'Usuario'), 100))
     email = clean_text(datos.get('email'), 254)
 
     if not email or not email_valid(email):
-        return jsonify({"error": "Email inválido"}), 400
+        return jsonify({"error": "Hace falta un email válido"}), 400
 
     html = f"""
     <div style="font-family: Arial, sans-serif; padding: 20px; background-color: #f4f6f8;">
@@ -606,25 +953,32 @@ def email_bienvenida():
             <h1 style="color: #12303a; margin-top: 0;">¡Bienvenido/a a La Palma Princess!</h1>
             <p>Hola <strong>{nombre}</strong>,</p>
             <p>Gracias por registrarte en nuestra plataforma. Tu cuenta ha sido creada correctamente.</p>
+            <p>Ahora podrás realizar tus reservas de forma más rápida y acceder a ofertas exclusivas para tu estancia en Fuencaliente.</p>
+            <hr style="border: none; border-top: 1px solid #eeeeee; margin: 20px 0;">
+            <p style="font-size: 12px; color: #777;">
+                Si deseas dejar de recibir correos comerciales, puedes
+                <a href="{PUBLIC_BASE_URL}/desuscrito.html?email={escape(email)}">darte de baja aquí</a>.
+            </p>
         </div>
     </div>
     """
-    if send_email(email, "¡Bienvenido a La Palma Princess!", "Bienvenido a La Palma Princess", html):
-        return jsonify({"mensaje": "Correo enviado correctamente"}), 200
-    return jsonify({"error": "Falló el envío de correo"}), 500
+    enviado = send_email(email, "¡Bienvenido/a a La Palma Princess!", html)
+    # El usuario ya está registrado: un fallo de correo no debe romper el registro.
+    return jsonify({"mensaje": "Correo enviado correctamente" if enviado else "Usuario registrado, pero falló el envío de correo",
+                    "email_sent": enviado}), 200
 
 
 @app.route('/api/email-reserva', methods=['POST'])
 def email_reserva():
     datos = request.get_json(silent=True) or {}
-    nombre = clean_text(datos.get('nombre', 'Huésped'), 100)
+    nombre = escape(clean_text(datos.get('nombre', 'Huésped'), 100))
     email = clean_text(datos.get('email'), 254)
-    checkin = datos.get('checkin')
-    checkout = datos.get('checkout')
-    habitacion = datos.get('habitacion')
-    num_habitaciones = datos.get('num_habitaciones', 1)
-    adultos = datos.get('adultos', 1)
-    ninos = datos.get('ninos', 0)
+    checkin = escape(clean_text(datos.get('checkin'), 20))
+    checkout = escape(clean_text(datos.get('checkout'), 20))
+    habitacion = escape(clean_text(datos.get('habitacion'), 40))
+    num_habitaciones = escape(clean_text(datos.get('num_habitaciones', 1), 3))
+    adultos = escape(clean_text(datos.get('adultos', 1), 3))
+    ninos = escape(clean_text(datos.get('ninos', 0), 3))
 
     if not email or not email_valid(email):
         return jsonify({"error": "Hace falta un email válido"}), 400
@@ -634,19 +988,27 @@ def email_reserva():
         <div style="max-width: 600px; margin: 0 auto; background: white; border-radius: 8px; padding: 30px; border-top: 5px solid #12303a;">
             <h1 style="color: #12303a; margin-top: 0;">Confirmación de Reserva</h1>
             <p>Hola <strong>{nombre}</strong>,</p>
-            <p>Hemos recibido tu solicitud de reserva en el <strong>Hotel Princess La Palma</strong>:</p>
-            <ul>
-                <li><strong>Entrada:</strong> {checkin}</li>
-                <li><strong>Salida:</strong> {checkout}</li>
-                <li><strong>Habitación:</strong> {habitacion} ({num_habitaciones} hab.)</li>
-                <li><strong>Huéspedes:</strong> {adultos} adulto(s), {ninos} niño(s)</li>
-            </ul>
+            <p>Hemos recibido tu solicitud de reserva en el <strong>Hotel Princess La Palma</strong>. A continuación detallamos los datos de tu estancia:</p>
+
+            <table style="width: 100%; border-collapse: collapse; margin: 20px 0; background: #f8fafb; border: 1px solid #e2e8f0;">
+                <tr><td style="padding: 10px; border-bottom: 1px solid #e2e8f0;"><strong>Fecha de entrada:</strong></td><td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">{checkin}</td></tr>
+                <tr><td style="padding: 10px; border-bottom: 1px solid #e2e8f0;"><strong>Fecha de salida:</strong></td><td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">{checkout}</td></tr>
+                <tr><td style="padding: 10px; border-bottom: 1px solid #e2e8f0;"><strong>Tipo de habitación:</strong></td><td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">{habitacion} ({num_habitaciones} hab.)</td></tr>
+                <tr><td style="padding: 10px;"><strong>Huéspedes:</strong></td><td style="padding: 10px;">{adultos} adulto(s), {ninos} niño(s)</td></tr>
+            </table>
+
+            <p>Te responderemos por email en menos de 24 horas para formalizar el proceso.</p>
+            <hr style="border: none; border-top: 1px solid #eeeeee; margin: 20px 0;">
+            <p style="font-size: 12px; color: #777;">
+                Si deseas cancelar tu suscripción o dejar de recibir estos avisos, haz clic en
+                <a href="{PUBLIC_BASE_URL}/desuscrito.html?email={escape(email)}">darse de baja</a>.
+            </p>
         </div>
     </div>
     """
-    if send_email(email, "Confirmación de tu reserva - Hotel Princess La Palma", "Confirmación de reserva", html):
-        return jsonify({"mensaje": "Correo enviado correctamente"}), 200
-    return jsonify({"error": "Falló el envío de correo"}), 500
+    enviado = send_email(email, "Confirmación de tu reserva - Hotel Princess La Palma", html)
+    return jsonify({"mensaje": "Correo enviado correctamente" if enviado else "Reserva registrada, pero falló el envío de correo",
+                    "email_sent": enviado}), 200
 
 
 if __name__ == '__main__':
