@@ -55,7 +55,12 @@ SERVICE_TIMES = {"spa": ("09:00", "11:00", "13:00", "15:00", "17:00"),
                  "activity": ("09:00", "11:00", "15:00", "17:00")}
 
 # MODELOS DE RESPALDO PARA EL CHATBOT
-MODELOS_IA = ['gemini-3.8-flash', 'gemini-1.5-flash']
+MODELOS_IA = MODELOS_IA = [
+    'gemini-2.5-flash',
+    'gemini-2.5-pro',
+    'gemini-2.0-flash',
+    'gemini-1.5-flash-8b'
+]
 
 
 @contextmanager
