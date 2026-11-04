@@ -57,9 +57,9 @@ SERVICE_TIMES = {"spa": ("09:00", "11:00", "13:00", "15:00", "17:00"),
 # MODELOS DE RESPALDO PARA EL CHATBOT
 MODELOS_IA = [
     'gemini-3.8-flash',
-    'gemini-3.1-pro-preview'
+    'gemini-2.0-flash',
+    'gemini-1.5-flash'
 ]
-
 
 @contextmanager
 def connect_db():
