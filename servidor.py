@@ -3,6 +3,7 @@ import re
 import secrets
 import sqlite3
 import hashlib
+import logging
 import smtplib
 import threading
 import traceback
@@ -23,6 +24,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
+app.logger.setLevel(logging.INFO)  # para que los INFO salgan en los logs de Render
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
 
 # CORS total para evitar cualquier tipo de bloqueo con GitHub Pages
@@ -521,7 +523,8 @@ def chat():
                     )
                     texto = (response.text or "").strip() if response else ""
                     if texto:
-                        return jsonify({"respuesta": texto})
+                        app.logger.info("CHAT OK -> respondió la IA con el modelo %s | pregunta: %.80s", modelo_nombre, pregunta_usuario)
+                        return jsonify({"respuesta": texto, "modelo": modelo_nombre})
                     app.logger.warning("Modelo %s devolvió respuesta vacía", modelo_nombre)
                     break
                 except Exception as e_modelo:
@@ -532,6 +535,7 @@ def chat():
                         continue
                     break
 
+        app.logger.error("CHAT FALLO -> ningún modelo respondió (probados: %s)", ", ".join(MODELOS_IA))
         # Si llegamos aquí NO es que falte el dato: es que la IA no ha respondido.
         return jsonify({
             "respuesta": "El asistente está saturado en este momento. Inténtalo de nuevo en unos segundos.",
