@@ -55,11 +55,16 @@ SERVICE_TIMES = {"spa": ("09:00", "11:00", "13:00", "15:00", "17:00"),
                  "activity": ("09:00", "11:00", "15:00", "17:00")}
 
 # MODELOS DE RESPALDO PARA EL CHATBOT
+# Se pueden cambiar SIN tocar el codigo: en Render -> Environment -> MODELOS_IA
+# (nombres separados por comas, el primero es el preferido).
+# Comprueba los nombres vigentes en https://ai.google.dev/gemini-api/docs/models
 MODELOS_IA = [
-    'gemini-3.8-flash',
-    'gemini-2.0-flash',
-    'gemini-1.5-flash'
+    m.strip() for m in os.getenv(
+        "MODELOS_IA",
+        "gemini-3.6-flash,gemini-3.5-flash,gemini-3.1-flash-lite"
+    ).split(",") if m.strip()
 ]
+
 
 @contextmanager
 def connect_db():
@@ -409,14 +414,29 @@ def health():
     return jsonify({"ok": True})
 
 
+def _datos_dinamicos():
+    precios = "\n".join(
+        f"- {nombre}: desde {datos['price']} EUR por habitacion y noche."
+        for nombre, datos in ROOMS.items()
+    )
+    nombres = {"spa": "Spa", "restaurant": "Restaurante", "activity": "Actividades"}
+    horarios = "\n".join(
+        f"- {nombres[k]} (reservable en la web): {', '.join(v)}."
+        for k, v in SERVICE_TIMES.items()
+    )
+    return precios, horarios
+
+
+_PRECIOS, _HORARIOS = _datos_dinamicos()
+
 CONTEXTO_HOTEL = """
 Eres el recepcionista virtual del hotel La Palma Princess (Hotel Princess La Palma).
 Responde en el idioma del cliente, con tono amable y respuestas breves.
 
 REGLAS ESTRICTAS:
 - Responde SOLO con la información de este texto.
-- Si el dato no aparece aquí (precios, horarios, políticas...), di claramente que no
-  tienes ese dato y sugiere contactar con el hotel por teléfono, email o WhatsApp.
+- Antes de decir que no tienes un dato, revisa TODO el texto de abajo. Solo si de verdad
+  no aparece, di que no lo tienes y sugiere contactar con el hotel por teléfono, email o WhatsApp.
 - Nunca inventes precios, horarios, servicios ni condiciones.
 - No puedes hacer reservas: indica que usen la página de Reservas.
 - Si preguntan algo que no tiene que ver con el hotel, di que solo puedes ayudar con temas del hotel.
@@ -427,13 +447,18 @@ INFORMACIÓN OFICIAL:
 - Dirección: Carretera de la Costa, Cerca Vieja, 10, 38749 Fuencaliente de La Palma.
 - Teléfono: +34 922 42 55 11 (lunes a viernes, de 09:00 a 17:00).
 - WhatsApp: 613 48 90 55.
-- Email: hotelPrincessLaPalma@gmail.com.
+- Email: hotelprincesslapalmatrabajo@gmail.com.
 
 ZONAS:
 - Zona general (familiar): siete piscinas exteriores, con piscina infantil, playa de arena artificial y solárium.
 - Esencia de La Palma: zona exclusiva para adultos (+16), con cuatro piscinas, una climatizada en invierno.
 
-HABITACIONES (el precio no está publicado: se consulta al reservar):
+PRECIOS (por noche, segun la pagina de Reservas):
+{PRECIOS}
+- Suplemento por adulto extra (mas de 2 por habitacion): 30 EUR/noche. Por nino: 12 EUR/noche.
+- Descuento de residente: 10%. Codigo promocional: 5%.
+
+HABITACIONES:
 - Estándar: 22 m², estilo colonial, cama king size o dos individuales, sofá, baño con bañera y ducha,
   aire acondicionado y terraza o balcón. Hasta 3 adultos o 2 adultos y 2 niños.
 - Familiar Superior: 44 m², dos habitaciones Estándar comunicadas, dos baños, vistas al jardín.
@@ -454,7 +479,15 @@ RESERVAS:
 - Se hacen en la página de Reservas. Responden por email en menos de 24 horas.
 - Se pueden reservar hasta 4 habitaciones. Hay campo para código promocional (6 dígitos) y opción de residente.
 - Adultos: desde 12 años. Niños: hasta 11 años.
-"""
+
+SERVICIOS RESERVABLES EN LA WEB (horas disponibles):
+{HORARIOS}
+""".replace("{PRECIOS}", _PRECIOS).replace("{HORARIOS}", _HORARIOS)
+
+
+def _error_temporal(exc):
+    t = str(exc).upper()
+    return any(c in t for c in ("429", "500", "503", "RESOURCE_EXHAUSTED", "UNAVAILABLE", "OVERLOADED", "TIMEOUT"))
 
 
 @app.route('/chat', methods=['POST'])
@@ -464,38 +497,68 @@ def chat():
         if not datos or "mensaje" not in datos:
             return jsonify({"respuesta": "No se ha recibido ningún mensaje."}), 400
 
-        pregunta_usuario = str(datos.get("mensaje", "")).strip()
-        idioma_detectado = str(datos.get("idioma", "es")).strip()
+        pregunta_usuario = str(datos.get("mensaje", "")).strip()[:1000]
+        idioma_detectado = str(datos.get("idioma", "es")).strip()[:10]
 
         if not pregunta_usuario:
             return jsonify({"respuesta": "No se ha recibido ningún mensaje."}), 400
         if not client:
-            return jsonify({"respuesta": "El asistente virtual no está configurado (falta GEMINI_API_KEY en Render)."}), 503
+            app.logger.error("Chat sin cliente Gemini: falta GEMINI_API_KEY o el paquete google-genai")
+            return jsonify({"respuesta": "El asistente virtual no está configurado.", "error": "sin_configurar"}), 503
 
         consulta_con_idioma = f"[Responder obligatoriamente en el idioma con código ISO: '{idioma_detectado}']\nPregunta: {pregunta_usuario}"
 
-        # Recorre los modelos de respaldo (Gemini 2.5 y 2.0)
         for modelo_nombre in MODELOS_IA:
-            try:
-                response = client.models.generate_content(
-                    model=modelo_nombre,
-                    contents=consulta_con_idioma,
-                    config=types.GenerateContentConfig(
-                        system_instruction=CONTEXTO_HOTEL,
-                        temperature=0.7,
-                    ),
-                )
-                if response and response.text:
-                    return jsonify({"respuesta": response.text})
-            except Exception as e_modelo:
-                app.logger.warning(f"Error en modelo {modelo_nombre}: {e_modelo}")
-                continue
+            for intento in range(2):
+                try:
+                    response = client.models.generate_content(
+                        model=modelo_nombre,
+                        contents=consulta_con_idioma,
+                        config=types.GenerateContentConfig(
+                            system_instruction=CONTEXTO_HOTEL,
+                            temperature=0.3,
+                        ),
+                    )
+                    texto = (response.text or "").strip() if response else ""
+                    if texto:
+                        return jsonify({"respuesta": texto})
+                    app.logger.warning("Modelo %s devolvió respuesta vacía", modelo_nombre)
+                    break
+                except Exception as e_modelo:
+                    # error (no warning) para que se vea claro en los logs de Render
+                    app.logger.error("Fallo con modelo %s (intento %s): %s", modelo_nombre, intento + 1, e_modelo)
+                    if intento == 0 and _error_temporal(e_modelo):
+                        time.sleep(1.5)
+                        continue
+                    break
 
-        return jsonify({"respuesta": "No tengo ese dato ahora mismo. Escríbenos por WhatsApp al 613 48 90 55 o llámanos al +34 922 42 55 11."}), 200
+        # Si llegamos aquí NO es que falte el dato: es que la IA no ha respondido.
+        return jsonify({
+            "respuesta": "El asistente está saturado en este momento. Inténtalo de nuevo en unos segundos.",
+            "error": "ia_no_disponible",
+        }), 503
 
     except Exception:
         app.logger.exception("Error general en endpoint /chat")
-        return jsonify({"respuesta": "Lo siento, ha ocurrido un error de conexión con la IA. Vuelve a intentarlo en unos segundos."}), 500
+        return jsonify({"respuesta": "Lo siento, ha ocurrido un error. Vuelve a intentarlo en unos segundos.", "error": "interno"}), 500
+
+
+@app.get("/api/chat-debug")
+def chat_debug():
+    """Solo si pones CHAT_DEBUG=1 en Render. Muestra que modelos ve tu API key."""
+    if os.getenv("CHAT_DEBUG") != "1":
+        return api_error("No disponible.", 404)
+    if not client:
+        return jsonify({"cliente": False, "modelos_configurados": MODELOS_IA})
+    try:
+        disponibles = sorted(m.name.replace("models/", "") for m in client.models.list())
+    except Exception as e:
+        return jsonify({"cliente": True, "error": str(e), "modelos_configurados": MODELOS_IA}), 500
+    return jsonify({
+        "modelos_configurados": MODELOS_IA,
+        "configurados_que_existen": [m for m in MODELOS_IA if m in disponibles],
+        "disponibles": [m for m in disponibles if "gemini" in m],
+    })
 
 
 @app.route('/enviar-email-promocional', methods=['POST'])
