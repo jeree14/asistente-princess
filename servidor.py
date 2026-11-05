@@ -497,6 +497,23 @@ def logout():
             db.execute("DELETE FROM sessions WHERE token_hash = ?", (hash_token(token),))
     return jsonify({"message": "Sesión cerrada."})
 
+@app.delete("/api/auth/delete-account")
+def delete_account():
+    token = bearer_token()
+    if not token:
+        return api_error("No hay una sesión activa.", 401)
+    with connect_db() as db:
+        user = current_user(db)
+        if not user:
+            return api_error("La sesión ha caducado.", 401)
+        
+        db.execute("DELETE FROM users WHERE id = ?", (user["id"],))
+        
+        send_async(user["email"], "Cuenta eliminada - La Palma Princess", 
+                   f"Hola {user['name']}:\n\nTu cuenta ha sido eliminada permanentemente.")
+        notify_hotel("Baja de usuario", f"El usuario {user['name']} ({user['email']}) ha eliminado su cuenta.")
+
+    return jsonify({"message": "Cuenta eliminada permanentemente."}), 200
 
 @app.get("/api/auth/me")
 def me():
