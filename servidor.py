@@ -7,6 +7,10 @@ import smtplib
 import threading
 import time
 import logging
+import json
+import urllib.error
+import urllib.request
+
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from email.message import EmailMessage
@@ -16,12 +20,16 @@ from zoneinfo import ZoneInfo
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 from dotenv import load_dotenv
 
 load_dotenv()
 
 app = Flask(__name__)
+# En Render hay un proxy delante: sin esto todos los visitantes parecen la misma persona
+# y el límite de 10 registros por hora se compartiría entre todos.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 app.logger.setLevel(logging.INFO)  # para que los INFO (CHAT OK ...) salgan en los logs de Render
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
 
@@ -49,6 +57,9 @@ client = genai.Client(api_key=api_key) if genai and api_key else None
 HOTEL_NAME = "La Palma Princess"
 HOTEL_EMAIL = os.getenv("HOTEL_EMAIL", "hotelPrincessLaPalma@gmail.com")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
+BREVO_API_KEY = os.getenv("BREVO_API_KEY", "").strip()
+BREVO_API_URL = os.getenv("BREVO_API_URL", "https://api.brevo.com/v3/smtp/email")
+MAIL_FROM = os.getenv("MAIL_FROM") or os.getenv("SMTP_FROM") or HOTEL_EMAIL
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "reservas.sqlite3"))
 HOTEL_TIMEZONE = ZoneInfo("Atlantic/Canary")
 
@@ -197,21 +208,47 @@ def email_valid(value):
     return len(value) <= 254 and re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value) is not None
 
 
-def send_email(recipient, subject, body):
-    """Envía un correo (texto o HTML si el cuerpo empieza por '<').
-    La contraseña NUNCA va en el código: se lee de la variable SMTP_PASSWORD en Render
-    (para Gmail, una 'contraseña de aplicación')."""
+def _enviar_brevo(recipient, subject, body, reply_to=None):
+    """Envía con la API de Brevo (HTTPS, puerto 443). Funciona en Render gratis."""
+    es_html = body.lstrip().startswith("<")
+    payload = {
+        "sender": {"name": HOTEL_NAME, "email": MAIL_FROM},
+        "to": [{"email": recipient}],
+        "subject": subject,
+    }
+    payload["htmlContent" if es_html else "textContent"] = body
+    if reply_to:
+        payload["replyTo"] = {"email": reply_to}
+    peticion = urllib.request.Request(
+        BREVO_API_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"api-key": BREVO_API_KEY, "Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(peticion, timeout=15) as respuesta:
+            return 200 <= respuesta.status < 300
+    except urllib.error.HTTPError as error:
+        # Aquí sale el motivo real: 401 = clave mala, 400 = remitente sin verificar
+        app.logger.error("Brevo rechazó el correo a %s: HTTP %s %s", recipient, error.code,
+                         error.read().decode("utf-8", "replace")[:300])
+    except (urllib.error.URLError, OSError, ValueError):
+        app.logger.exception("No se pudo conectar con Brevo para enviar el correo a %s", recipient)
+    return False
+ 
+ 
+def _enviar_smtp(recipient, subject, body, reply_to=None):
+    """SMTP clásico. En Render gratis los puertos 25/465/587 están bloqueados: allí usa Brevo."""
     host = os.getenv("SMTP_HOST", "smtp.gmail.com")
     port = int(os.getenv("SMTP_PORT", "465"))
     username = os.getenv("SMTP_USERNAME", "hotelprincesslapalmatrabajo@gmail.com")
     password = os.getenv("SMTP_PASSWORD")
-    if not password:
-        app.logger.warning("SMTP_PASSWORD no configurado: no se envía el correo a %s", recipient)
-        return False
     message = EmailMessage()
     message["Subject"] = subject
     message["From"] = os.getenv("SMTP_FROM") or username
     message["To"] = recipient
+    if reply_to:
+        message["Reply-To"] = reply_to
     if body.lstrip().startswith("<"):
         message.set_content("Este mensaje está en formato HTML.")
         message.add_alternative(body, subtype="html")
@@ -227,8 +264,29 @@ def send_email(recipient, subject, body):
             smtp.send_message(message)
         return True
     except (OSError, smtplib.SMTPException, ValueError):
-        app.logger.exception("No se pudo enviar el correo a %s", recipient)
+        app.logger.exception("No se pudo enviar el correo a %s por SMTP", recipient)
         return False
+ 
+ 
+def send_email(recipient, subject, body, reply_to=None):
+    """Envía un correo (HTML si el cuerpo empieza por '<'). Usa Brevo si hay BREVO_API_KEY."""
+    if BREVO_API_KEY:
+        return _enviar_brevo(recipient, subject, body, reply_to)
+    if os.getenv("SMTP_PASSWORD"):
+        return _enviar_smtp(recipient, subject, body, reply_to)
+    app.logger.warning("Correo NO enviado a %s: falta BREVO_API_KEY (o SMTP_PASSWORD).", recipient)
+    return False
+ 
+ 
+def send_async(recipient, subject, body, reply_to=None):
+    """Envía en segundo plano para no hacer esperar al visitante."""
+    threading.Thread(target=send_email, args=(recipient, subject, body, reply_to), daemon=True).start()
+ 
+ 
+def notify_hotel(subject, body, reply_to=None):
+    """Aviso al buzón del propietario (HOTEL_EMAIL). 'Responder' contesta al cliente."""
+    if HOTEL_EMAIL:
+        send_async(HOTEL_EMAIL, "[Web] " + subject, body, reply_to)
 
 
 def booking_total(room, rooms, adults, children, nights, resident, promo):
@@ -402,6 +460,7 @@ def register():
     </div>
     """
     send_email(email, "¡Bienvenido/a a La Palma Princess!", html_bienvenida)
+    notify_hotel("Nueva alta de usuario", f"Nombre: {name}\nEmail: {email}", reply_to=email)
 
     return jsonify({"token": token, "user": {"name": name, "email": email}}), 201
 
@@ -483,6 +542,9 @@ def cancel_my_booking(reference):
         user["email"], f"Cancelación {reference.upper()} - {HOTEL_NAME}",
         f"Hola {user['name']}:\n\nTu reserva {reference.upper()} ha sido cancelada."
     )
+    notify_hotel(f"Reserva cancelada {reference.upper()}",
+                 f"Referencia: {reference.upper()}\nCliente: {user['name']}\nEmail: {user['email']}",
+                 reply_to=user["email"])
     return jsonify({"message": "Reserva cancelada.", "email_sent": email_sent})
 
 
@@ -577,6 +639,15 @@ def create_booking():
         return api_error("No se pudo registrar la solicitud. Inténtalo de nuevo.", 409)
 
     email_sent = send_booking_email(email, name, reference, token, checkin.isoformat(), checkout.isoformat(), total)
+    notify_hotel(
+        f"Nueva reserva {reference}",
+        f"Referencia: {reference}\nCliente: {name}\nEmail: {email}\n"
+        f"Habitación: {room} x{rooms}\nEntrada: {checkin.isoformat()}\nSalida: {checkout.isoformat()}\n"
+        f"Adultos: {adults}  Niños: {children}\nResidente: {'sí' if resident else 'no'}\n"
+        f"Código promocional: {promo or '-'}\nTotal orientativo: {total:.2f} EUR\n"
+        f"Comentarios: {message or '-'}",
+        reply_to=email,
+    )
     return jsonify({
         "reference": reference,
         "management_token": token,
@@ -619,6 +690,9 @@ def cancel_booking(token):
         booking["email"], f"Cancelación {booking['reference']} - {HOTEL_NAME}",
         f"Hola {booking['name']}:\n\nTu reserva {booking['reference']} ha sido cancelada."
     )
+    notify_hotel(f"Reserva cancelada {booking['reference']}",
+                 f"Referencia: {booking['reference']}\nCliente: {booking['name']}\nEmail: {booking['email']}",
+                 reply_to=booking["email"])
     return jsonify({"message": "Reserva cancelada.", "email_sent": email_sent})
 
 
@@ -661,6 +735,13 @@ def update_booking(token):
         f"Hola {booking['name']}:\n\nTu reserva se ha actualizado.\n"
         f"Entrada: {checkin.isoformat()}\nSalida: {checkout.isoformat()}\n"
         f"Habitación: {room}\nTotal orientativo: {total:.2f} EUR."
+    )
+    notify_hotel(
+        f"Reserva modificada {booking['reference']}",
+        f"Referencia: {booking['reference']}\nCliente: {booking['name']}\nEmail: {booking['email']}\n"
+        f"Entrada: {checkin.isoformat()}\nSalida: {checkout.isoformat()}\n"
+        f"Habitación: {room} x{rooms}\nTotal orientativo: {total:.2f} EUR",
+        reply_to=booking["email"],
     )
     return jsonify({
         "message": "Reserva actualizada.",
@@ -735,6 +816,12 @@ def create_service_booking():
         f"Hola {name}:\n\nHemos registrado tu reserva de {service} para {service_date.isoformat()} "
         f"a las {service_time} ({guests} asistentes).\nReferencia: {reference}"
     )
+    notify_hotel(
+        f"Nueva reserva de servicio {reference}",
+        f"Referencia: {reference}\nCliente: {name}\nEmail: {email}\nServicio: {service}\n"
+        f"Fecha: {service_date.isoformat()} {service_time}\nAsistentes: {guests}\nNotas: {notes or '-'}",
+        reply_to=email,
+    )
     return jsonify({
         "reference": reference,
         "email_sent": email_sent,
@@ -760,12 +847,26 @@ def subscribe_newsletter():
         email, f"Suscripción confirmada - {HOTEL_NAME}",
         f"Gracias por suscribirte a las novedades de {HOTEL_NAME}."
     )
+    notify_hotel("Nueva suscripción a la newsletter", f"Email: {email.lower()}", reply_to=email)
     return jsonify({
         "message": "Suscripción confirmada." if email_sent else
                    "Suscripción guardada correctamente.",
         "email_sent": email_sent,
     }), 201
 
+@app.post("/api/newsletter/unsubscribe")
+def unsubscribe_newsletter():
+    data = json_payload()
+    email = clean_text(data.get("email"), 254).lower() if data else ""
+    if not email_valid(email):
+        return api_error("Escribe un email válido.", 400)
+    with connect_db() as db:
+        removed = db.execute("DELETE FROM subscribers WHERE email = ?", (email,)).rowcount > 0
+    if removed:
+        send_async(email, f"Baja confirmada - {HOTEL_NAME}",
+                   f"Te has dado de baja de las novedades de {HOTEL_NAME}. No recibirás más correos comerciales.")
+        notify_hotel("Baja de la newsletter", f"Email: {email}")
+    return jsonify({"message": "Baja realizada." if removed else "Ese email no estaba suscrito."})
 
 def _datos_dinamicos():
     precios = "\n".join(
@@ -957,13 +1058,17 @@ def email_bienvenida():
             <hr style="border: none; border-top: 1px solid #eeeeee; margin: 20px 0;">
             <p style="font-size: 12px; color: #777;">
                 Si deseas dejar de recibir correos comerciales, puedes
-                <a href="{PUBLIC_BASE_URL}/desuscrito.html?email={escape(email)}">darte de baja aquí</a>.
+                <a href="{PUBLIC_BASE_URL}/desuscrito.html?email={escape(email)}">darse de baja aquí</a>.
             </p>
         </div>
     </div>
     """
     enviado = send_email(email, "¡Bienvenido/a a La Palma Princess!", html)
-    # El usuario ya está registrado: un fallo de correo no debe romper el registro.
+    
+    # NUEVO: Te envía un aviso a ti como propietario (usa tu variable HOTEL_EMAIL)
+    html_propietario = f"<h1>📢 Nuevo Registro</h1><p>El usuario <b>{nombre}</b> ({email}) se ha dado de alta en la web.</p>"
+    send_email(HOTEL_EMAIL, "📢 Nuevo registro de usuario en la web", html_propietario)
+
     return jsonify({"mensaje": "Correo enviado correctamente" if enviado else "Usuario registrado, pero falló el envío de correo",
                     "email_sent": enviado}), 200
 
@@ -997,7 +1102,7 @@ def email_reserva():
                 <tr><td style="padding: 10px;"><strong>Huéspedes:</strong></td><td style="padding: 10px;">{adultos} adulto(s), {ninos} niño(s)</td></tr>
             </table>
 
-            <p>Te responderemos por email en menos de 24 horas para formalizar el proceso.</p>
+            <p>Te responderemos por email en menos de 24 hours para formalizar el proceso.</p>
             <hr style="border: none; border-top: 1px solid #eeeeee; margin: 20px 0;">
             <p style="font-size: 12px; color: #777;">
                 Si deseas cancelar tu suscripción o dejar de recibir estos avisos, haz clic en
@@ -1007,6 +1112,20 @@ def email_reserva():
     </div>
     """
     enviado = send_email(email, "Confirmación de tu reserva - Hotel Princess La Palma", html)
+    
+    # NUEVO: Te envía un aviso detallado a ti como propietario (usa tu variable HOTEL_EMAIL)
+    html_propietario = f"""
+    <h1>🚨 NUEVA RESERVA EN LA WEB</h1>
+    <p>Un cliente ha completado una solicitud de reserva:</p>
+    <ul>
+        <li><b>Cliente:</b> {nombre} ({email})</li>
+        <li><b>Habitación:</b> {habitacion} ({num_habitaciones} habs.)</li>
+        <li><b>Estancia:</b> del {checkin} al {checkout}</li>
+        <li><b>Huéspedes:</b> {adultos} Adultos, {ninos} Niños</li>
+    </ul>
+    """
+    send_email(HOTEL_EMAIL, "🚨 Nueva Solicitud de Reserva Recibida", html_propietario)
+
     return jsonify({"mensaje": "Correo enviado correctamente" if enviado else "Reserva registrada, pero falló el envío de correo",
                     "email_sent": enviado}), 200
 
