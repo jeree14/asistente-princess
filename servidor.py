@@ -507,6 +507,9 @@ def delete_account():
         if not user:
             return api_error("La sesión ha caducado.", 401)
         
+        db.execute("DELETE FROM sessions WHERE user_id = ?", (user["id"],))
+        db.execute("UPDATE bookings SET user_id = NULL WHERE user_id = ?", (user["id"],))
+        db.execute("UPDATE service_bookings SET user_id = NULL WHERE user_id = ?", (user["id"],))
         db.execute("DELETE FROM users WHERE id = ?", (user["id"],))
         
         send_async(user["email"], "Cuenta eliminada - La Palma Princess", 
@@ -1146,6 +1149,56 @@ def email_reserva():
     return jsonify({"mensaje": "Correo enviado correctamente" if enviado else "Reserva registrada, pero falló el envío de correo",
                     "email_sent": enviado}), 200
 
+# ───────────────────────── Panel de administración (lista de registros) ─────────────────────────
+# Solo funciona si en Render pones la variable ADMIN_KEY. Se abre en: /admin?clave=TU_CLAVE
+ADMIN_KEY = os.getenv("ADMIN_KEY", "").strip()
+
+
+def _tabla_html(titulo, cabeceras, filas):
+    cab = "".join(f"<th>{escape(c)}</th>" for c in cabeceras)
+    cuerpo = "".join(
+        "<tr>" + "".join(f"<td>{escape(str(v if v is not None else ''))}</td>" for v in fila) + "</tr>"
+        for fila in filas
+    ) or f'<tr><td colspan="{len(cabeceras)}">Sin datos</td></tr>'
+    return f"<h2>{escape(titulo)} ({len(filas)})</h2><table><tr>{cab}</tr>{cuerpo}</table>"
+
+
+@app.get("/admin")
+def admin_panel():
+    if not ADMIN_KEY:
+        return api_error("No disponible.", 404)
+    ip_key = "admin|" + (request.remote_addr or "")
+    if attempts_count(ip_key, LOGIN_WINDOW) >= MAX_LOGIN_FAILS:
+        return api_error("Demasiados intentos. Espera unos minutos.", 429)
+    if not secrets.compare_digest(request.args.get("clave", "").encode(), ADMIN_KEY.encode()):
+        attempts_add(ip_key)
+        return api_error("No disponible.", 404)
+    with connect_db() as db:
+        usuarios = db.execute("SELECT name, email, created_at FROM users ORDER BY id DESC").fetchall()
+        reservas = db.execute(
+            "SELECT reference, name, email, room, rooms, checkin, checkout, total, status "
+            "FROM bookings ORDER BY id DESC LIMIT 200").fetchall()
+        servicios = db.execute(
+            "SELECT reference, name, email, service, service_date, service_time, guests "
+            "FROM service_bookings ORDER BY id DESC LIMIT 200").fetchall()
+        suscriptores = db.execute("SELECT email, created_at FROM subscribers ORDER BY id DESC").fetchall()
+    registrados = ", ".join(escape(u["name"]) for u in usuarios) or "nadie todavía"
+    pagina = (
+        '<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="robots" content="noindex">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1"><title>Panel</title>'
+        '<style>body{font-family:Arial,sans-serif;margin:24px;color:#12303a}'
+        'table{border-collapse:collapse;width:100%;margin-bottom:24px;font-size:14px}'
+        'th,td{border:1px solid #cfd8dc;padding:6px 8px;text-align:left}th{background:#12303a;color:#fff}</style>'
+        '</head><body><h1>La Palma Princess · Panel</h1>'
+        f'<p><strong>Registrados ({len(usuarios)}):</strong> {registrados}</p>'
+        + _tabla_html("Cuentas", ["Nombre", "Email", "Alta (UTC)"], usuarios)
+        + _tabla_html("Reservas de habitación", ["Ref.", "Nombre", "Email", "Habitación", "Hab.", "Entrada", "Salida", "Total", "Estado"], reservas)
+        + _tabla_html("Reservas de servicios", ["Ref.", "Nombre", "Email", "Servicio", "Fecha", "Hora", "Personas"], servicios)
+        + _tabla_html("Suscriptores", ["Email", "Alta (UTC)"], suscriptores)
+        + '</body></html>'
+    )
+    return pagina, 200, {"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store",
+                         "Referrer-Policy": "no-referrer", "X-Robots-Tag": "noindex"}
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=os.getenv("FLASK_DEBUG") == "1")
